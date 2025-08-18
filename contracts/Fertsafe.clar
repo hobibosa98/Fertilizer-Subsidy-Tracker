@@ -7,12 +7,16 @@
 (define-constant ERR_ALREADY_CLAIMED (err u105))
 (define-constant ERR_EXPIRED (err u106))
 (define-constant ERR_NOT_ELIGIBLE (err u107))
+(define-constant ERR_INVALID_RATING (err u108))
+(define-constant ERR_ALREADY_REVIEWED (err u109))
+(define-constant ERR_CANNOT_REVIEW_OWN (err u110))
 
 (define-data-var contract-admin principal CONTRACT_OWNER)
 (define-data-var total-subsidies-allocated uint u0)
 (define-data-var total-subsidies-claimed uint u0)
 (define-data-var next-subsidy-id uint u1)
 (define-data-var registration-fee uint u1000000)
+(define-data-var next-feedback-id uint u1)
 
 (define-map farmers principal {
     name: (string-ascii 50),
@@ -43,6 +47,35 @@
 })
 
 (define-map admin-permissions principal bool)
+
+(define-map fertilizer-feedback uint {
+    farmer: principal,
+    fertilizer-type: (string-ascii 30),
+    rating: uint,
+    effectiveness-rating: uint,
+    delivery-rating: uint,
+    comment: (string-ascii 200),
+    submitted-at: uint,
+    verified: bool
+})
+
+(define-map farmer-feedback-history principal (list 20 uint))
+
+(define-map fertilizer-ratings (string-ascii 30) {
+    total-ratings: uint,
+    total-score: uint,
+    total-effectiveness: uint,
+    total-delivery: uint,
+    average-rating: uint,
+    average-effectiveness: uint,
+    average-delivery: uint
+})
+
+(define-map feedback-responses uint {
+    responder: principal,
+    response: (string-ascii 300),
+    responded-at: uint
+})
 
 (define-public (set-admin (new-admin principal))
     (begin
@@ -228,6 +261,85 @@
     )
 )
 
+(define-public (submit-fertilizer-feedback (fertilizer-type (string-ascii 30)) (rating uint) (effectiveness-rating uint) (delivery-rating uint) (comment (string-ascii 200)))
+    (let (
+        (farmer-data (unwrap! (map-get? farmers tx-sender) ERR_NOT_FOUND))
+        (feedback-id (var-get next-feedback-id))
+        (current-feedback-history (default-to (list) (map-get? farmer-feedback-history tx-sender)))
+        (current-ratings (default-to { total-ratings: u0, total-score: u0, total-effectiveness: u0, total-delivery: u0, average-rating: u0, average-effectiveness: u0, average-delivery: u0 } (map-get? fertilizer-ratings fertilizer-type)))
+    )
+        (asserts! (get verified farmer-data) ERR_NOT_ELIGIBLE)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+        (asserts! (and (>= effectiveness-rating u1) (<= effectiveness-rating u5)) ERR_INVALID_RATING)
+        (asserts! (and (>= delivery-rating u1) (<= delivery-rating u5)) ERR_INVALID_RATING)
+        
+        (map-set fertilizer-feedback feedback-id {
+            farmer: tx-sender,
+            fertilizer-type: fertilizer-type,
+            rating: rating,
+            effectiveness-rating: effectiveness-rating,
+            delivery-rating: delivery-rating,
+            comment: comment,
+            submitted-at: stacks-block-height,
+            verified: false
+        })
+        
+        (map-set farmer-feedback-history tx-sender (unwrap! (as-max-len? (append current-feedback-history feedback-id) u20) ERR_INVALID_AMOUNT))
+        
+        (let (
+            (new-total-ratings (+ (get total-ratings current-ratings) u1))
+            (new-total-score (+ (get total-score current-ratings) rating))
+            (new-total-effectiveness (+ (get total-effectiveness current-ratings) effectiveness-rating))
+            (new-total-delivery (+ (get total-delivery current-ratings) delivery-rating))
+            (new-average-rating (/ new-total-score new-total-ratings))
+            (new-average-effectiveness (/ new-total-effectiveness new-total-ratings))
+            (new-average-delivery (/ new-total-delivery new-total-ratings))
+        )
+            (map-set fertilizer-ratings fertilizer-type {
+                total-ratings: new-total-ratings,
+                total-score: new-total-score,
+                total-effectiveness: new-total-effectiveness,
+                total-delivery: new-total-delivery,
+                average-rating: new-average-rating,
+                average-effectiveness: new-average-effectiveness,
+                average-delivery: new-average-delivery
+            })
+        )
+        
+        (var-set next-feedback-id (+ feedback-id u1))
+        (ok feedback-id)
+    )
+)
+
+(define-public (verify-feedback (feedback-id uint))
+    (let ((feedback-data (unwrap! (map-get? fertilizer-feedback feedback-id) ERR_NOT_FOUND)))
+        (asserts! (is-admin tx-sender) ERR_UNAUTHORIZED)
+        (map-set fertilizer-feedback feedback-id (merge feedback-data { verified: true }))
+        (ok true)
+    )
+)
+
+(define-public (respond-to-feedback (feedback-id uint) (response (string-ascii 300)))
+    (let ((feedback-data (unwrap! (map-get? fertilizer-feedback feedback-id) ERR_NOT_FOUND)))
+        (asserts! (is-admin tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (get verified feedback-data) ERR_NOT_ELIGIBLE)
+        (map-set feedback-responses feedback-id {
+            responder: tx-sender,
+            response: response,
+            responded-at: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (moderate-feedback (feedback-id uint))
+    (let ((feedback-data (unwrap! (map-get? fertilizer-feedback feedback-id) ERR_NOT_FOUND)))
+        (asserts! (is-admin tx-sender) ERR_UNAUTHORIZED)
+        (map-delete fertilizer-feedback feedback-id)
+        (ok true)
+    )
+)
+
 (define-read-only (get-farmer (farmer principal))
     (map-get? farmers farmer)
 )
@@ -277,3 +389,29 @@
         u0
     )
 )
+
+(define-read-only (get-feedback (feedback-id uint))
+    (map-get? fertilizer-feedback feedback-id)
+)
+
+(define-read-only (get-farmer-feedback-history (farmer principal))
+    (map-get? farmer-feedback-history farmer)
+)
+
+(define-read-only (get-fertilizer-ratings (fertilizer-type (string-ascii 30)))
+    (map-get? fertilizer-ratings fertilizer-type)
+)
+
+(define-read-only (get-feedback-response (feedback-id uint))
+    (map-get? feedback-responses feedback-id)
+)
+
+(define-read-only (get-feedback-stats)
+    {
+        next-feedback-id: (var-get next-feedback-id)
+    }
+)
+
+
+
+

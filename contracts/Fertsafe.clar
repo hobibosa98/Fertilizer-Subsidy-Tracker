@@ -10,10 +10,6 @@
 (define-constant ERR_INVALID_RATING (err u108))
 (define-constant ERR_ALREADY_REVIEWED (err u109))
 (define-constant ERR_CANNOT_REVIEW_OWN (err u110))
-(define-constant ERR_REGION_NOT_FOUND (err u111))
-(define-constant ERR_REGION_EXISTS (err u112))
-(define-constant ERR_QUOTA_EXCEEDED (err u113))
-(define-constant ERR_INVALID_REGION (err u114))
 
 (define-data-var contract-admin principal CONTRACT_OWNER)
 (define-data-var total-subsidies-allocated uint u0)
@@ -81,30 +77,6 @@
     responded-at: uint
 })
 
-;; Regional distribution management maps
-(define-map regions (string-ascii 50) {
-    name: (string-ascii 100),
-    created-at: uint,
-    active: bool,
-    regional-admin: (optional principal)
-})
-
-(define-map regional-quotas { region: (string-ascii 50), fertilizer-type: (string-ascii 30) } {
-    quota-limit: uint,
-    allocated: uint,
-    remaining: uint,
-    updated-at: uint
-})
-
-(define-map farmer-regions principal (string-ascii 50))
-
-(define-map regional-statistics (string-ascii 50) {
-    total-farmers: uint,
-    total-subsidies: uint,
-    total-claimed: uint,
-    last-updated: uint
-})
-
 (define-public (set-admin (new-admin principal))
     (begin
         (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
@@ -133,19 +105,6 @@
     (or 
         (is-eq user (var-get contract-admin))
         (default-to false (map-get? admin-permissions user))
-    )
-)
-
-;; Check if user is regional admin for a specific region
-(define-private (is-regional-admin (user principal) (region (string-ascii 50)))
-    (let ((region-data (map-get? regions region)))
-        (match region-data
-            region-info (match (get regional-admin region-info)
-                some-admin (is-eq user some-admin)
-                false
-            )
-            false
-        )
     )
 )
 
@@ -206,7 +165,6 @@
     (let (
         (farmer-data (unwrap! (map-get? farmers farmer) ERR_NOT_FOUND))
         (fertilizer-data (unwrap! (map-get? fertilizer-inventory fertilizer-type) ERR_NOT_FOUND))
-        (farmer-region (map-get? farmer-regions farmer))
         (subsidy-id (var-get next-subsidy-id))
         (current-subsidies (default-to (list) (map-get? farmer-subsidies farmer)))
         (expires-at (+ stacks-block-height validity-blocks))
@@ -215,35 +173,6 @@
         (asserts! (get verified farmer-data) ERR_NOT_ELIGIBLE)
         (asserts! (> amount u0) ERR_INVALID_AMOUNT)
         (asserts! (>= (- (get total-stock fertilizer-data) (get allocated fertilizer-data)) amount) ERR_INSUFFICIENT_FUNDS)
-        
-        ;; Check regional quota if farmer has assigned region
-        (match farmer-region
-            region-code 
-                (let (
-                    (quota-key { region: region-code, fertilizer-type: fertilizer-type })
-                    (quota-data (map-get? regional-quotas quota-key))
-                )
-                    (match quota-data
-                        quota-info 
-                            (begin
-                                (asserts! (>= (get remaining quota-info) amount) ERR_QUOTA_EXCEEDED)
-                                (map-set regional-quotas quota-key (merge quota-info { 
-                                    allocated: (+ (get allocated quota-info) amount),
-                                    remaining: (- (get remaining quota-info) amount)
-                                }))
-                                ;; Update regional statistics
-                                (let ((region-stats (default-to { total-farmers: u0, total-subsidies: u0, total-claimed: u0, last-updated: u0 } (map-get? regional-statistics region-code))))
-                                    (map-set regional-statistics region-code (merge region-stats { 
-                                        total-subsidies: (+ (get total-subsidies region-stats) amount),
-                                        last-updated: stacks-block-height 
-                                    }))
-                                )
-                            )
-                        true ;; No quota set for this region/fertilizer combo
-                    )
-                )
-            true ;; No region assigned
-        )
         
         (map-set subsidies subsidy-id {
             farmer: farmer,
@@ -411,79 +340,6 @@
     )
 )
 
-;; Regional management functions
-(define-public (create-region (region-code (string-ascii 50)) (region-name (string-ascii 100)))
-    (let ((existing-region (map-get? regions region-code)))
-        (asserts! (is-admin tx-sender) ERR_UNAUTHORIZED)
-        (asserts! (is-none existing-region) ERR_REGION_EXISTS)
-        (map-set regions region-code {
-            name: region-name,
-            created-at: stacks-block-height,
-            active: true,
-            regional-admin: none
-        })
-        (map-set regional-statistics region-code {
-            total-farmers: u0,
-            total-subsidies: u0,
-            total-claimed: u0,
-            last-updated: stacks-block-height
-        })
-        (ok true)
-    )
-)
-
-(define-public (assign-regional-admin (region-code (string-ascii 50)) (admin principal))
-    (let ((region-data (unwrap! (map-get? regions region-code) ERR_REGION_NOT_FOUND)))
-        (asserts! (is-admin tx-sender) ERR_UNAUTHORIZED)
-        (asserts! (get active region-data) ERR_INVALID_REGION)
-        (map-set regions region-code (merge region-data { regional-admin: (some admin) }))
-        (ok true)
-    )
-)
-
-(define-public (set-regional-quota (region-code (string-ascii 50)) (fertilizer-type (string-ascii 30)) (quota uint))
-    (let (
-        (region-data (unwrap! (map-get? regions region-code) ERR_REGION_NOT_FOUND))
-        (quota-key { region: region-code, fertilizer-type: fertilizer-type })
-    )
-        (asserts! (or (is-admin tx-sender) (is-regional-admin tx-sender region-code)) ERR_UNAUTHORIZED)
-        (asserts! (get active region-data) ERR_INVALID_REGION)
-        (asserts! (> quota u0) ERR_INVALID_AMOUNT)
-        (map-set regional-quotas quota-key {
-            quota-limit: quota,
-            allocated: u0,
-            remaining: quota,
-            updated-at: stacks-block-height
-        })
-        (ok true)
-    )
-)
-
-(define-public (assign-farmer-region (farmer principal) (region-code (string-ascii 50)))
-    (let (
-        (region-data (unwrap! (map-get? regions region-code) ERR_REGION_NOT_FOUND))
-        (farmer-data (unwrap! (map-get? farmers farmer) ERR_NOT_FOUND))
-        (current-stats (default-to { total-farmers: u0, total-subsidies: u0, total-claimed: u0, last-updated: u0 } (map-get? regional-statistics region-code)))
-    )
-        (asserts! (or (is-admin tx-sender) (is-regional-admin tx-sender region-code)) ERR_UNAUTHORIZED)
-        (asserts! (get active region-data) ERR_INVALID_REGION)
-        (map-set farmer-regions farmer region-code)
-        (map-set regional-statistics region-code (merge current-stats { 
-            total-farmers: (+ (get total-farmers current-stats) u1),
-            last-updated: stacks-block-height 
-        }))
-        (ok true)
-    )
-)
-
-(define-public (deactivate-region (region-code (string-ascii 50)))
-    (let ((region-data (unwrap! (map-get? regions region-code) ERR_REGION_NOT_FOUND)))
-        (asserts! (is-admin tx-sender) ERR_UNAUTHORIZED)
-        (map-set regions region-code (merge region-data { active: false }))
-        (ok true)
-    )
-)
-
 (define-read-only (get-farmer (farmer principal))
     (map-get? farmers farmer)
 )
@@ -554,37 +410,6 @@
     {
         next-feedback-id: (var-get next-feedback-id)
     }
-)
-
-;; Regional read-only functions
-(define-read-only (get-region-info (region-code (string-ascii 50)))
-    (map-get? regions region-code)
-)
-
-(define-read-only (get-farmer-region (farmer principal))
-    (map-get? farmer-regions farmer)
-)
-
-(define-read-only (get-regional-quota (region-code (string-ascii 50)) (fertilizer-type (string-ascii 30)))
-    (map-get? regional-quotas { region: region-code, fertilizer-type: fertilizer-type })
-)
-
-(define-read-only (get-regional-statistics (region-code (string-ascii 50)))
-    (map-get? regional-statistics region-code)
-)
-
-(define-read-only (is-region-active (region-code (string-ascii 50)))
-    (match (map-get? regions region-code)
-        region-data (get active region-data)
-        false
-    )
-)
-
-(define-read-only (get-regional-admin (region-code (string-ascii 50)))
-    (match (map-get? regions region-code)
-        region-data (get regional-admin region-data)
-        none
-    )
 )
 
 
